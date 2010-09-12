@@ -55,6 +55,14 @@
 #define TC_CTL_MODE            (0x1 <<  6)	// (TC) Control: Mode bit
 #define TC_CTL_ENABLE          (0x1 <<  7)	// (TC) Control: Enable bit
 
+#define EP9312_HCLK_FREQ 14756600
+#define EP9312_TC_FREQ_0     2000
+#define EP9312_TC_FREQ_1   580000
+#define EP9312_TC4_FREQ    983040
+
+#define EP9312_TC16_MOD     0xffff
+#define EP9312_TC32_MOD 0xffffffff
+
 struct ep9312_tc_io
 {
 	/* I/O register
@@ -62,10 +70,19 @@ struct ep9312_tc_io
 	u32 load;		/* Load Register */
 	u32 value;		/* Value Register */
 	u32 ctl;		/* Control Register */
-	u32 clear;		/* Clear Register */
+        u32 counter;            /* Step-down counter */
 
 	u32 mod_value;		/* TC1 and TC2: 0xffff; TC3: 0xffffffff */
+};
 
+#define EP9312_TC_ENABLE_BIT (1ULL << (8 + 32))
+
+struct ep9312_tc4_io
+{
+    /* I/O registers (clock 4)
+     * */
+    u64 value;                  /* Value register */
+    u32 counter;
 };
 
 
@@ -135,5 +152,20 @@ struct ep9312_uart_io
 	u32 sysflg;
 };
 
+#define EP9312_NR_INT_PER_VIC 32
+
+struct ep9312_vic_io {
+        u32 int_status;
+        u32 int_mask;
+        u32 int_mode;
+        u32 int_soft;
+
+        /*
+         * Required for vectored interrupts
+        u32 def_vec_addr;
+        u32 vec_addr[EP9312_NR_INT_PER_VIC];
+        u8  vec_ctl[EP9312_NR_INT_PER_VIC];
+        */
+};
 
 #endif /*__EP931200_H_ */

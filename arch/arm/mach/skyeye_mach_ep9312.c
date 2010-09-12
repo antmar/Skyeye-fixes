@@ -54,6 +54,8 @@ ARMword ep9312_io_read_word (ARMul_State * state, ARMword addr);
 
 
 #define NR_UART			3
+#define NR_VIC			2
+#define NR_TC			3
 
 #define UART_FR_TXFE	(1<<7)
 #define UART_FR_RXFE	(1<<4)
@@ -61,22 +63,66 @@ ARMword ep9312_io_read_word (ARMul_State * state, ARMword addr);
 #define UART_IIR_RIS	(1<<1)
 #define UART_IIR_TIS	(1<<2)
 
+typedef struct ep9312_tcoi {
+    int vic;
+    int bit;
+} ep9312_tcoi_t;
 
-const int TCOI[2] = { 1 << 4, 1 << 5 };
+const ep9312_tcoi_t TCOI[3] = { {0, 1 << 4}, {0, 1 << 5}, {1, 1 << (51 - 32)} };
 const int UART_RXINTR[3] = { 1 << 23, 1 << 25, 1 << 27 };
 const int UART_TXINTR[3] = { 1 << 24, 1 << 26, 1 << 28 };
 const int INT_UART[3] = { 1 << (52 - 32), 1 << (54 - 32), 1 << (55 - 32) };
 const int iConsole = 0;		//index of uart of serial console
+
+/* Helper functions for working with the VICs */
+static void VIC_init( int vic );
+static u32 VIC_irq_status( int vic );
+static u32 VIC_fiq_status( int vic );
+static u32 VIC_int_select( int vic );
+static void VIC_select_int( int vic, u32 bits );
+static u32 VIC_int_enabled( int vic );
+static void VIC_enable_int( int vic, u32 bits );
+static void VIC_disable_int( int vic, u32 bits );
+static u32 VIC_raw_int( int vic );
+static void VIC_raise_int( int vic, u32 bits );
+static void VIC_clear_int( int vic, u32 bits );
+static u32 VIC_int_soft_status( int vic );
+static void VIC_raise_soft_int( int vic, u32 bits );
+static void VIC_clear_soft_int( int vic, u32 bits );
+/*
+ * Required for vectored interrupts
+static u32 VIC_addr( int vic );
+static u32 VIC_def_addr( int vic );
+static void VIC_set_def_addr( int vic, u32 bits );
+static u32 VIC_vec_addr( int vic, int slot );
+static void VIC_set_vec_addr( int vic, int slot, u32 addr );
+static u32 VIC_vec_ctl( int vic, int slot );
+static void VIC_set_vec_ctl( int vic, int slot, u32 bits );
+*/
+
+/* Helper functions for working with timers */
+static void Tc_init( int id );
+static void Tc_cycle( int id, ARMul_State * state );
+static u32 Tc_load( int id );
+static void Tc_set_load( int id, u32 bits );
+static u32 Tc_value( int id );
+static u32 Tc_ctl( int id );
+static void Tc_set_ctl( int id, u32 bits );
+
+static void Tc4_init();
+static void Tc4_cycle( ARMul_State * state );
+static u32 Tc4_value_low();
+static u32 Tc4_value_high();
+static void Tc4_set_high_value( u32 bits );
 
 /*Internal IO Register*/
 typedef struct ep9312_io
 {
 	ARMword syscon_devcfg;	/* System control */
 
-	ARMword intsr[2];	/* Interrupt status reg */
-	ARMword intmr[2];	/* Interrupt mask reg */
-
-	struct ep9312_tc_io tc[4];
+        struct ep9312_vic_io  vic[NR_VIC];
+	struct ep9312_tc_io   tc[NR_TC];
+	struct ep9312_tc4_io  tc4;
 	struct ep9312_uart_io uart[NR_UART];
 
 } ep9312_io_t;
@@ -87,11 +133,10 @@ static ep9312_io_t ep9312_io;
 static void
 ep9312_update_int (ARMul_State * state)
 {
-	ARMword requests = io.intsr[0] & io.intmr[0];
-	requests |= io.intsr[1] & io.intmr[1];
-
-	state->NfiqSig = (requests & 0x0001) ? LOW : HIGH;
-	state->NirqSig = (requests & 0xfffe) ? LOW : HIGH;
+        u32 fiq_request = VIC_fiq_status( 0 ) || VIC_fiq_status( 1 );
+        u32 irq_request = VIC_irq_status( 0 ) || VIC_irq_status( 1 );
+	state->NfiqSig = fiq_request ? LOW : HIGH;
+	state->NirqSig = irq_request ? LOW : HIGH;
 }
 
 static void
@@ -99,17 +144,13 @@ ep9312_io_reset (ARMul_State * state)
 {
 	int i;
 	io.syscon_devcfg = 0;
-	io.intmr[0] = 0;
-	io.intmr[1] = 0;
+        VIC_init( 0 );
+        VIC_init( 1 );
 
-	/* reset TC register */
-	io.tc[0].value = 0;
-	io.tc[1].value = 0;
-	io.tc[2].value = 0;
-	io.tc[0].mod_value = 0xffff;
-	io.tc[1].mod_value = 0xffff;
-	io.tc[2].mod_value = 0xffffffff;
-
+        for( i = 0; i < NR_TC; ++i ) {
+            Tc_init( i );
+        }
+        Tc4_init();
 
 	for (i = 0; i < NR_UART; i++) {
 		io.uart[i].dr = 0;
@@ -123,23 +164,13 @@ ep9312_io_do_cycle (ARMul_State * state)
 {
 	int i;
 	
-	/* We must implement TC1, TC2 and TC4 */
-	for (i = 0; i < 2; i++) {
-		if (io.tc[i].value == 0) {
-			if (io.tc[i].ctl & TC_CTL_MODE)
-				io.tc[i].value = io.tc[i].load;
-			else
-				io.tc[i].value = io.tc[i].mod_value;
-			io.intsr[0] |= TCOI[i];
-			ep9312_update_int (state);
-		}
-		else {
-			io.tc[i].value--;
-		}
+	/* We implement TC1, TC2, TC3 and TC4 */
+	for (i = 0; i < NR_TC; i++) {
+            Tc_cycle( i, state );
 	}
-	io.tc[3].load++;
+        Tc4_cycle( state );
 
-	if (!(io.intsr[0] & (UART_RXINTR[iConsole]))
+	if (!(VIC_raw_int(0) & (UART_RXINTR[iConsole]))
 	    && io.uart[iConsole].dr == 0) {
 		/* 2007-01-18 modified by Anthony Lee : for new uart device frame */
 		struct timeval tv;
@@ -151,15 +182,13 @@ ep9312_io_do_cycle (ARMul_State * state)
 		if(skyeye_uart_read(-1, &buf, 1, &tv, NULL) > 0)
 		{
 			io.uart[iConsole].dr = (int) buf;
-			io.intsr[0] |= UART_RXINTR[iConsole];
-			io.intmr[0] |= UART_RXINTR[iConsole];
-			io.intsr[1] |= INT_UART[iConsole];
-			io.intmr[1] |= INT_UART[iConsole];
+                        VIC_raise_int( 0, UART_RXINTR[iConsole] );
+                        VIC_raise_int( 1, INT_UART[iConsole] );
 			io.uart[iConsole].iir |= UART_IIR_RIS;
 			io.uart[iConsole].fr &= ~UART_FR_RXFE;
 			ep9312_update_int (state);
 		}
-	}			//if (!(io.intsr & URXINT))
+	}
 }
 
 
@@ -170,8 +199,8 @@ ep9312_uart_read (ARMul_State * state, u32 offset, u32 * data, int index)
 	case UART_DR:
 		*data = io.uart[index].dr;
 		io.uart[index].dr = 0;
-		io.intsr[0] &= ~(UART_RXINTR[index]);
-		io.intsr[1] &= ~(INT_UART[index]);
+                VIC_clear_int( 0, UART_RXINTR[index] );
+                VIC_clear_int( 1, INT_UART[index] );
 		io.uart[index].iir &= ~UART_IIR_RIS;
 		io.uart[index].fr |= UART_FR_RXFE;
 		extern ARMul_State* state;
@@ -230,19 +259,15 @@ ep9312_uart_write (ARMul_State * state, u32 offset, u32 data, int index)
 		{
 			io.uart[index].cr = data;
 			if ((data & AMBA_UARTCR_TIE) == 0) {
-				io.intmr[0] &= ~(UART_TXINTR[index]);
-				io.intsr[0] &= ~(UART_TXINTR[index]);
-				io.intsr[1] &= ~(INT_UART[index]);
-				io.intmr[1] &= ~(INT_UART[index]);
+                                VIC_clear_int( 0, UART_RXINTR[index] );
+                                VIC_clear_int( 1, INT_UART[index] );
 
 				io.uart[index].iir &= ~(UART_IIR_TIS);	//Interrupt Identification and Clear
 			}
 			else {
 
-				io.intmr[0] |= (UART_TXINTR[index]);
-				io.intsr[0] |= (UART_TXINTR[index]);
-				io.intsr[1] = (INT_UART[index]);
-				io.intmr[1] = (INT_UART[index]);
+                                VIC_raise_int( 0, UART_RXINTR[iConsole] );
+                                VIC_raise_int( 1, INT_UART[iConsole] );
 				io.uart[index].iir |= (UART_IIR_TIS);
 			}
 			extern ARMul_State * state;
@@ -273,21 +298,15 @@ ep9312_uart_write (ARMul_State * state, u32 offset, u32 data, int index)
 static void
 ep9312_tc_read (u32 offset, u32 * data, int index)
 {
-	if (index == 4) {
-		if (offset == TC_VALUELOW)
-			*data = io.tc[index].load;
-		else if (offset == TC_VALUEHIGH)
-			*data = io.tc[index].value;
-	}
 	switch (offset) {
 	case TC_LOAD:
-		*data = io.tc[index].load;
+		*data = Tc_load( index );
 		break;
 	case TC_VALUE:
-		*data = io.tc[index].value;
+		*data = Tc_value( index );
 		break;
 	case TC_CTL:
-		*data = io.tc[index].ctl;
+		*data = Tc_ctl( index );
 		break;
 	case TC_CLEAR:
 		SKYEYE_DBG ("%s(0x%x, 0x%x): read WO register\n", __func__,
@@ -303,17 +322,17 @@ ep9312_tc_write (ARMul_State * state, u32 offset, u32 data, int index)
 {
 	switch (offset) {
 	case TC_LOAD:
-		io.tc[index].load = data;
+                Tc_set_load( index, data );
 		break;
 	case TC_VALUE:
 		SKYEYE_DBG ("%s(0x%x, 0x%x): write RO register\n", __func__,
 			    offset, data);
 		break;
 	case TC_CTL:
-		io.tc[index].ctl = data;
+		Tc_set_ctl( index, data );
 		break;
 	case TC_CLEAR:
-		io.intsr[0] &= ~TCOI[index];
+                VIC_clear_int( TCOI[index].vic, TCOI[index].bit );
 		extern ARMul_State * state;
 		ep9312_update_int (state);
 		break;
@@ -346,42 +365,81 @@ ep9312_io_read_word (ARMul_State * state, ARMword addr)
 	    (addr < (EP9312_TC_BASE1 + EP9312_TC_SIZE))) {
 		ep9312_tc_read ((u32) (addr - EP9312_TC_BASE1),
 				(u32 *) & data, 0);
+            return data;
 	}
 	/* TC2 */
-	if ((addr >= EP9312_TC_BASE4) &&
-	    (addr < (EP9312_TC_BASE4 + EP9312_TC_SIZE))) {
-		ep9312_tc_read ((u32) (addr - EP9312_TC_BASE4),
-				(u32 *) & data, 3);
+	if ((addr >= EP9312_TC_BASE2) &&
+	    (addr < (EP9312_TC_BASE2 + EP9312_TC_SIZE))) {
+		ep9312_tc_read ((u32) (addr - EP9312_TC_BASE2),
+				(u32 *) & data, 1);
+            return data;
+	}
+	/* TC3 */
+	if ((addr >= EP9312_TC_BASE3) &&
+	    (addr < (EP9312_TC_BASE3 + EP9312_TC_SIZE))) {
+		ep9312_tc_read ((u32) (addr - EP9312_TC_BASE3),
+				(u32 *) & data, 2);
+            return data;
 	}
 	/* UART1 */
 	if ((addr >= EP9312_UART_BASE1) &&
 	    (addr < (EP9312_UART_BASE1 + EP9312_UART_SIZE))) {
 		ep9312_uart_read (state, (u32) (addr - EP9312_UART_BASE1),
 				  (u32 *) & data, 0);
-		return data;
+	    return data;
 	}
 	/* UART3 */
 	if ((addr >= EP9312_UART_BASE3) &&
 	    (addr < (EP9312_UART_BASE3 + EP9312_UART_SIZE))) {
 		ep9312_uart_read (state, (u32) (addr - EP9312_UART_BASE3),
 				  (u32 *) & data, 2);
-		return data;
+	    return data;
 	}
 	switch (addr) {
 	case SYSCON_PWRCNT:
 		break;
-	case VIC0INTENABLE:
-		data = io.intmr[0];
-//              printf("%s(0x%08x) = 0x%08x\n", __func__, addr, data);
-		break;
+        case TIMER4VALUELOW:
+                data = Tc4_value_low();
+                break;
+        case TIMER4VALUEHIGH:
+                data = Tc4_value_high();
+                break;
 	case VIC0IRQSTATUS:
-		data = io.intsr[0];
-		io.intsr[0] = 0;	//!!!
+		data = VIC_irq_status( 0 );
 		break;
 	case VIC1IRQSTATUS:
-		data = io.intsr[1];
-		io.intsr[1] = 0;
+		data = VIC_irq_status( 1 );
 		break;
+	case VIC0FIQSTATUS:
+		data = VIC_fiq_status( 0 );
+		break;
+	case VIC1FIQSTATUS:
+		data = VIC_fiq_status( 1 );
+		break;
+	case VIC0RAWINTR:
+		data = VIC_raw_int( 0 );
+		break;
+	case VIC1RAWINTR:
+		data = VIC_raw_int( 1 );
+		break;
+        case VIC0INTSELECT:
+                data = VIC_int_select( 0 );
+                break;
+        case VIC1INTSELECT:
+                data = VIC_int_select( 1 );
+                break;
+	case VIC0INTENABLE:
+		data = VIC_int_enabled( 0 );
+		break;
+	case VIC1INTENABLE:
+		data = VIC_int_enabled( 1 );
+		break;
+        case VIC0SOFTINT:
+                data = VIC_int_soft_status( 0 );
+                break;
+        case VIC1SOFTINT:
+                data = VIC_int_soft_status( 1 );
+                break;
 	case RTCDR:
 	case AACGCR:
 	case AACRGIS:
@@ -414,20 +472,40 @@ void
 ep9312_io_write_word (ARMul_State * state, ARMword addr, ARMword data)
 {
 	ARMword tmp;
+        /* TC1 */
 	if ((addr >= EP9312_TC_BASE1) &&
 	    (addr < (EP9312_TC_BASE1 + EP9312_TC_SIZE))) {
 		ep9312_tc_write (state, (u32) (addr - EP9312_TC_BASE1), data,
 				 0);
+            return;
 	}
+        /* TC2 */
+	if ((addr >= EP9312_TC_BASE2) &&
+	    (addr < (EP9312_TC_BASE2 + EP9312_TC_SIZE))) {
+		ep9312_tc_write (state, (u32) (addr - EP9312_TC_BASE2), data,
+				 1);
+            return;
+	}
+        /* TC3 */
+	if ((addr >= EP9312_TC_BASE3) &&
+	    (addr < (EP9312_TC_BASE3 + EP9312_TC_SIZE))) {
+		ep9312_tc_write (state, (u32) (addr - EP9312_TC_BASE3), data,
+				 2);
+            return;
+        }
+        /* UART1 */
 	if ((addr >= EP9312_UART_BASE1) &&
 	    (addr < (EP9312_UART_BASE1 + EP9312_UART_SIZE))) {
 		ep9312_uart_write (state, (u32) (addr - EP9312_UART_BASE1),
 				   data, 0);
+            return;
 	}
+        /* UART3 */
 	if ((addr >= EP9312_UART_BASE3) &&
 	    (addr < (EP9312_UART_BASE3 + EP9312_UART_SIZE))) {
 		ep9312_uart_write (state, (u32) (addr - EP9312_UART_BASE3),
 				   data, 2);
+            return;
 	}
 
 	switch (addr) {
@@ -436,29 +514,51 @@ ep9312_io_write_word (ARMul_State * state, ARMword addr, ARMword data)
 	case SYSCON_CLKSET2:
 	case SYSCON_PWRCNT:
 		break;
+        case TIMER4VALUELOW:
+                break;
+        case TIMER4VALUEHIGH:
+                Tc4_set_high_value( data );
+                break;
+        case VIC0INTSELECT:
+                VIC_select_int( 0, data );
+		ep9312_update_int (state);
+                break;
+        case VIC1INTSELECT:
+                VIC_select_int( 1, data );
+		ep9312_update_int (state);
+                break;
 	case VIC0INTENABLE:
-		io.intmr[0] = data;
-		if (data != 0x10 && data != 0x20)
-			printf ("SKYEYE: write VIC0INTENABLE=0x%x\n", data);
-		extern ARMul_State * state;
+		VIC_enable_int( 0, data );
 		ep9312_update_int (state);
 		break;
 	case VIC1INTENABLE:
-		io.intmr[1] = data;
-//              printf("SKYEYE: write VIC1INTENABLE=0x%x\n", data);
-		extern ARMul_State * state;
+		VIC_enable_int( 1, data );
 		ep9312_update_int (state);
 		break;
 	case VIC0INTENCLEAR:
-		io.intmr[0] ^= data;
-		extern ARMul_State * state;
+                VIC_disable_int( 0, data );
 		ep9312_update_int (state);
 		break;
 	case VIC1INTENCLEAR:
-		io.intmr[1] ^= data;
-		extern ARMul_State * state;
+                VIC_disable_int( 1, data );
 		ep9312_update_int (state);
 		break;
+        case VIC0SOFTINT:
+                VIC_raise_soft_int( 0, data );
+		ep9312_update_int (state);
+                break;
+        case VIC1SOFTINT:
+                VIC_raise_soft_int( 1, data );
+		ep9312_update_int (state);
+                break;
+        case VIC0SOFTINTCLEAR:
+                VIC_clear_soft_int( 0, data );
+		ep9312_update_int (state);
+                break;
+        case VIC1SOFTINTCLEAR:
+                VIC_clear_soft_int( 1, data );
+		ep9312_update_int (state);
+                break;
 	case SYSCON_DEVCFG:
 		io.syscon_devcfg = data;
 		break;
@@ -492,4 +592,172 @@ ep9312_mach_init (void* arch_instance, machine_config_t * this_mach)
 
 	this_mach->mach_update_int = ep9312_update_int;
 
+}
+
+static void VIC_init( int vic )
+{
+    io.vic[vic].int_status = 0;
+    io.vic[vic].int_mask = 0;
+    io.vic[vic].int_mode = 0;
+    io.vic[vic].int_soft = 0;
+}
+static u32 VIC_irq_status( int vic )
+{
+    return (io.vic[vic].int_status | io.vic[vic].int_soft) & 
+           io.vic[vic].int_mask & 
+           ~io.vic[vic].int_mode;
+}
+static u32 VIC_fiq_status( int vic )
+{
+    return (io.vic[vic].int_status | io.vic[vic].int_soft) & 
+           io.vic[vic].int_mask & 
+           io.vic[vic].int_mode;
+}
+static u32 VIC_int_select( int vic )
+{
+    return io.vic[vic].int_mode;
+}
+static void VIC_select_int( int vic, u32 bits )
+{
+    io.vic[vic].int_mode = bits;
+}
+static u32 VIC_int_enabled( int vic )
+{
+    return io.vic[vic].int_mask;
+}
+static void VIC_enable_int( int vic, u32 bits )
+{
+    io.vic[vic].int_mask |= bits;
+}
+static void VIC_disable_int( int vic, u32 bits )
+{
+    io.vic[vic].int_mask &= ~bits;
+}
+static u32 VIC_raw_int( int vic )
+{
+    return io.vic[vic].int_status | io.vic[vic].int_soft;
+}
+static void VIC_raise_int( int vic, u32 bits )
+{
+    io.vic[vic].int_status |= bits;
+}
+static void VIC_clear_int( int vic, u32 bits )
+{
+    io.vic[vic].int_status &= ~bits;
+}
+static u32 VIC_int_soft_status( int vic )
+{
+    return io.vic[vic].int_soft;
+}
+static void VIC_raise_soft_int( int vic, u32 bits )
+{
+    io.vic[vic].int_soft |= bits;
+}
+static void VIC_clear_soft_int( int vic, u32 bits )
+{
+    io.vic[vic].int_soft &= ~bits;
+}
+
+#define EP9312_TC_COUNTER_LOAD_0 EP9312_HCLK_FREQ / EP9312_TC_FREQ_0
+#define EP9312_TC_COUNTER_LOAD_1 EP9312_HCLK_FREQ / EP9312_TC_FREQ_1
+#define EP9312_TC4_COUNTER_LOAD  EP9312_HCLK_FREQ / EP9312_TC4_FREQ
+
+static void Tc_init( int id )
+{
+    io.tc[id].load = 0;
+    io.tc[id].value = 0;
+    io.tc[id].ctl = 0;
+    switch( id ) {
+        case 0:
+            io.tc[id].mod_value = EP9312_TC16_MOD;
+            break;
+        case 1:
+            io.tc[id].mod_value = EP9312_TC16_MOD;
+            break;
+        case 2:
+            io.tc[id].mod_value = EP9312_TC32_MOD;
+            break;
+        default:
+            break;
+    }
+    io.tc[id].counter = 0;
+}
+static void Tc_cycle( int id, ARMul_State * state )
+{
+    if( io.tc[id].ctl & TC_CTL_ENABLE ) {
+        if (io.tc[id].value == 0) {
+            if (io.tc[id].ctl & TC_CTL_MODE)
+                io.tc[id].value = io.tc[id].load;
+            else
+                io.tc[id].value = io.tc[id].mod_value;
+            VIC_raise_int( TCOI[id].vic, TCOI[id].bit );
+            ep9312_update_int (state);
+        }
+        else {
+            if( io.tc[id].counter == 0 ) {
+                io.tc[id].value--;
+                io.tc[id].counter = 
+                    ( io.tc[id].ctl & TC_CTL_CLKSEL ) ?
+                        EP9312_TC_COUNTER_LOAD_0 :
+                        EP9312_TC_COUNTER_LOAD_1;
+            } else {
+                io.tc[id].counter--;
+            }
+        }
+    }
+}
+static u32 Tc_load( int id )
+{
+    return io.tc[id].load;
+}
+static void Tc_set_load( int id, u32 bits )
+{
+    io.tc[id].load = bits;
+    io.tc[id].value = bits;
+}
+static u32 Tc_value( int id )
+{
+    return io.tc[id].value;
+}
+static u32 Tc_ctl( int id )
+{
+    return io.tc[id].ctl;
+}
+static void Tc_set_ctl( int id, u32 bits )
+{
+    io.tc[id].ctl = bits;
+}
+
+static void Tc4_init()
+{
+    io.tc4.value = 0;
+    io.tc4.counter = 0;
+}
+static void Tc4_cycle( ARMul_State * state )
+{
+    if( io.tc4.value & EP9312_TC_ENABLE_BIT ) {
+        if( io.tc4.counter == 0 ) {
+            io.tc4.value++;
+            io.tc4.counter = EP9312_TC4_COUNTER_LOAD;
+        } else {
+            io.tc4.counter--;
+        }
+    }
+}
+static u32 Tc4_value_low()
+{
+    return (u32)io.tc4.value;
+}
+static u32 Tc4_value_high()
+{
+    return (u32)(io.tc4.value >> 32);
+}
+static void Tc4_set_high_value( u32 bits )
+{
+    io.tc4.value = (((u64)bits) << 32) & EP9312_TC_ENABLE_BIT |
+                   io.tc4.value & ~EP9312_TC_ENABLE_BIT;
+    if( (io.tc4.value & EP9312_TC_ENABLE_BIT) == 0 ) {
+        io.tc4.value = 0;
+        io.tc4.counter = 0;
+    }
 }
