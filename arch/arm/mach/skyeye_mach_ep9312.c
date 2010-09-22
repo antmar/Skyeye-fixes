@@ -259,14 +259,14 @@ ep9312_uart_write (ARMul_State * state, u32 offset, u32 data, int index)
 		{
 			io.uart[index].cr = data;
 			if ((data & AMBA_UARTCR_TIE) == 0) {
-                                VIC_clear_int( 0, UART_RXINTR[index] );
+                                VIC_clear_int( 0, UART_TXINTR[index] );
                                 VIC_clear_int( 1, INT_UART[index] );
 
 				io.uart[index].iir &= ~(UART_IIR_TIS);	//Interrupt Identification and Clear
 			}
 			else {
 
-                                VIC_raise_int( 0, UART_RXINTR[iConsole] );
+                                VIC_raise_int( 0, UART_TXINTR[iConsole] );
                                 VIC_raise_int( 1, INT_UART[iConsole] );
 				io.uart[index].iir |= (UART_IIR_TIS);
 			}
@@ -508,66 +508,69 @@ ep9312_io_write_word (ARMul_State * state, ARMword addr, ARMword data)
             return;
 	}
 
-	switch (addr) {
-	case SYSCON_CLKSET1:
-		break;
-	case SYSCON_CLKSET2:
-	case SYSCON_PWRCNT:
-		break;
-        case TIMER4VALUELOW:
-                break;
-        case TIMER4VALUEHIGH:
-                Tc4_set_high_value( data );
-                break;
-        case VIC0INTSELECT:
-                VIC_select_int( 0, data );
-		ep9312_update_int (state);
-                break;
-        case VIC1INTSELECT:
-                VIC_select_int( 1, data );
-		ep9312_update_int (state);
-                break;
-	case VIC0INTENABLE:
-		VIC_enable_int( 0, data );
-		ep9312_update_int (state);
-		break;
-	case VIC1INTENABLE:
-		VIC_enable_int( 1, data );
-		ep9312_update_int (state);
-		break;
-	case VIC0INTENCLEAR:
-                VIC_disable_int( 0, data );
-		ep9312_update_int (state);
-		break;
-	case VIC1INTENCLEAR:
-                VIC_disable_int( 1, data );
-		ep9312_update_int (state);
-		break;
-        case VIC0SOFTINT:
-                VIC_raise_soft_int( 0, data );
-		ep9312_update_int (state);
-                break;
-        case VIC1SOFTINT:
-                VIC_raise_soft_int( 1, data );
-		ep9312_update_int (state);
-                break;
-        case VIC0SOFTINTCLEAR:
-                VIC_clear_soft_int( 0, data );
-		ep9312_update_int (state);
-                break;
-        case VIC1SOFTINTCLEAR:
-                VIC_clear_soft_int( 1, data );
-		ep9312_update_int (state);
-                break;
-	case SYSCON_DEVCFG:
-		io.syscon_devcfg = data;
-		break;
-	default:
-		SKYEYE_DBG
-			("SKYEYE:unknown io addr, %s(0x%08x, 0x%08x), pc %x \n",
-			 __func__, addr, data, state->Reg[15]);
-		break;
-	}
+        {
+            extern ARMul_State * state; 
+            switch (addr) {
+                case SYSCON_CLKSET1:
+                    break;
+                case SYSCON_CLKSET2:
+                case SYSCON_PWRCNT:
+                    break;
+                case TIMER4VALUELOW:
+                    break;
+                case TIMER4VALUEHIGH:
+                    Tc4_set_high_value( data );
+                    break;
+                case VIC0INTSELECT:
+                    VIC_select_int( 0, data );
+                    ep9312_update_int (state);
+                    break;
+                case VIC1INTSELECT:
+                    VIC_select_int( 1, data );
+                    ep9312_update_int (state);
+                    break;
+                case VIC0INTENABLE:
+                    VIC_enable_int( 0, data );
+                    ep9312_update_int (state);
+                    break;
+                case VIC1INTENABLE:
+                    VIC_enable_int( 1, data );
+                    ep9312_update_int (state);
+                    break;
+                case VIC0INTENCLEAR:
+                    VIC_disable_int( 0, data );
+                    ep9312_update_int (state);
+                    break;
+                case VIC1INTENCLEAR:
+                    VIC_disable_int( 1, data );
+                    ep9312_update_int (state);
+                    break;
+                case VIC0SOFTINT:
+                    VIC_raise_soft_int( 0, data );
+                    ep9312_update_int (state);
+                    break;
+                case VIC1SOFTINT:
+                    VIC_raise_soft_int( 1, data );
+                    ep9312_update_int (state);
+                    break;
+                case VIC0SOFTINTCLEAR:
+                    VIC_clear_soft_int( 0, data );
+                    ep9312_update_int (state);
+                    break;
+                case VIC1SOFTINTCLEAR:
+                    VIC_clear_soft_int( 1, data );
+                    ep9312_update_int (state);
+                    break;
+                case SYSCON_DEVCFG:
+                    io.syscon_devcfg = data;
+                    break;
+                default:
+                    SKYEYE_DBG
+                        ("SKYEYE:unknown io addr, %s(0x%08x, 0x%08x), pc %x \n",
+                         __func__, addr, data, state->Reg[15]);
+                    break;
+            }
+        }
 }
 
 void
