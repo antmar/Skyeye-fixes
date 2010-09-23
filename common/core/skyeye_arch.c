@@ -103,7 +103,7 @@ do_arch_option (skyeye_option_t * this_option, int num_params,
 	return -1;
 }
 
-generic_arch_t* get_default_arch(){
+arch_config_t* get_default_arch(){
 	int i;
 	for (i = 0; i < MAX_SUPP_ARCH; i++) {
         	if (skyeye_archs[i] == NULL)
